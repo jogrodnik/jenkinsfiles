@@ -1,0 +1,7 @@
+To make the script more professional and suitable for running in Jenkins, we’ll add the following improvements:
+
+Logging and Output Control: Use logging with timestamps to capture outputs, and use functions to improve readability.
+Environment Variables: Support environment variables for flexibility, making it suitable for Jenkins.
+Error Handling and Exit Codes: Add error handling to exit gracefully on failures.
+Jenkins-Compatible Output: Use specific markers in the output to make it readable in Jenkins logs.
+Credential Management: Ensure the script can activate a GCP service account key provided via Jenkins to manage permissions.

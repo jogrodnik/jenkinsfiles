@@ -17,8 +17,15 @@ BUCKET_NAME=$2
 KMS_KEY=$3
 IFS=',' read -r -a SERVICE_ACCOUNTS <<< "$4"  # Split comma-separated service accounts into an array
 
-# Define the bucket location
-LOCATION="US"
+# Verify if any parameter is empty
+if [[ -z "$PROJECT_ID" || -z "$BUCKET_NAME" || -z "$KMS_KEY" || -z "${SERVICE_ACCOUNTS[*]}" ]]; then
+    echo "Error: One or more parameters are empty."
+    echo "Usage: $0 <PROJECT_ID> <BUCKET_NAME> <KMS_KEY> <SERVICE_ACCOUNTS>"
+    exit 1
+fi
+
+# Define constants
+LOCATION="US"  # Default bucket location; modify if necessary
 KEY_RETENTION_LIMIT=2  # Maximum number of active keys to retain per service account
 
 # Function to log messages with timestamps
@@ -34,6 +41,22 @@ check_service_account_exists() {
     else
         log_message "Service account $service_account does not exist. Skipping rotation."
         return 1  # Service account does not exist
+    fi
+}
+
+# Function to create a bucket with a KMS encryption key
+create_bucket_with_kms() {
+    local project_id=$1
+    local bucket_name=$2
+    local kms_key=$3
+
+    # Check if the bucket already exists
+    if gsutil ls -p "$project_id" "gs://$bucket_name" > /dev/null 2>&1; then
+        log_message "Bucket gs://$bucket_name already exists. No need to create."
+    else
+        log_message "Creating bucket gs://$bucket_name with encryption key $kms_key..."
+        gsutil mb -p "$project_id" -l "$LOCATION" -b on -k "$kms_key" "gs://$bucket_name"
+        log_message "Bucket gs://$bucket_name created with encryption key $kms_key."
     fi
 }
 
@@ -119,14 +142,8 @@ rotate_key() {
     rm "$new_key_file"
 }
 
-# Check if the bucket already exists and create it with KMS encryption if it doesn’t
-if gsutil ls -p "$PROJECT_ID" "gs://$BUCKET_NAME" > /dev/null 2>&1; then
-    log_message "Bucket gs://$BUCKET_NAME already exists. No need to create."
-else
-    log_message "Creating bucket gs://$BUCKET_NAME with encryption key $KMS_KEY..."
-    gsutil mb -p "$PROJECT_ID" -l "$LOCATION" -b on -k "$KMS_KEY" "gs://$BUCKET_NAME"
-    log_message "Bucket gs://$BUCKET_NAME created with encryption key $KMS_KEY."
-fi
+# Create the bucket with KMS encryption if it doesn't exist
+create_bucket_with_kms "$PROJECT_ID" "$BUCKET_NAME" "$KMS_KEY"
 
 # Main loop to iterate over each service account and rotate keys
 log_message "Starting key rotation for all specified service accounts"

@@ -1,0 +1,17 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Authenticate with GCP') {
+            steps {
+                withCredentials([file(credentialsId: 'gcp-service-account-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
+                    // Authenticate to GCP using the service account key
+                    sh '''
+                        gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
+                        gcloud config set project $PROJECT_ID
+                    '''
+                }
+            }
+        }
+    }
+}

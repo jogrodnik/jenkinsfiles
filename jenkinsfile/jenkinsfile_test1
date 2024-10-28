@@ -1,0 +1,146 @@
+pipeline {
+    agent any
+
+    // Define pipeline parameters for flexibility
+    parameters {
+        string(name: 'PROJECT_ID', defaultValue: 'your-project-id', description: 'Google Cloud Project ID')
+        string(name: 'KEY_RETENTION_LIMIT', defaultValue: '2', description: 'Number of active keys to retain')
+        string(name: 'SERVICE_ACCOUNTS', defaultValue: 'service-account-1@your-project-id.iam.gserviceaccount.com,service-account-2@your-project-id.iam.gserviceaccount.com,service-account-key-admin@your-project-id.iam.gserviceaccount.com', description: 'Comma-separated list of service accounts')
+    }
+
+    environment {
+        GOOGLE_APPLICATION_CREDENTIALS = credentials('gcp-service-account-key')  // Link to Jenkins GCP credential
+    }
+
+    stages {
+        stage('Authenticate to GCP') {
+            steps {
+                script {
+                    // Authenticate with GCP using the service account JSON key
+                    sh 'gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"'
+                    sh 'gcloud config set project $PROJECT_ID'
+                }
+            }
+        }
+
+        stage('Run Key Rotation Script') {
+            steps {
+                script {
+                    // Create a temporary shell script file with parameters passed from Jenkins
+                    def rotateKeysScript = '''
+                        #!/bin/bash
+                        
+                        set -e
+                        set -o pipefail
+                        
+                        PROJECT_ID="${PROJECT_ID}"
+                        KEY_RETENTION_LIMIT="${KEY_RETENTION_LIMIT}"
+                        IFS=',' read -r -a SERVICE_ACCOUNTS <<< "${SERVICE_ACCOUNTS}"
+                        
+                        BUCKET_NAME="${PROJECT_ID}-key-management"
+
+                        if ! gsutil ls -b "gs://${BUCKET_NAME}" > /dev/null 2>&1; then
+                            echo "Bucket gs://${BUCKET_NAME} does not exist. Creating it now..."
+                            gsutil mb -p "$PROJECT_ID" "gs://${BUCKET_NAME}"
+                            echo "Bucket gs://${BUCKET_NAME} created."
+                        else
+                            echo "Bucket gs://${BUCKET_NAME} already exists."
+                        fi
+                        
+                        log_message() {
+                            echo "$(date +'%Y-%m-%d %H:%M:%S') - $1"
+                        }
+                        
+                        check_service_account_exists() {
+                            local service_account=$1
+                            if gcloud iam service-accounts describe "$service_account" --project "$PROJECT_ID" > /dev/null 2>&1; then
+                                return 0
+                            else
+                                log_message "Service account $service_account does not exist. Skipping rotation."
+                                return 1
+                            fi
+                        }
+                        
+                        rotate_key() {
+                            local service_account=$1
+                            local service_name=${service_account%@*}
+                        
+                            log_message "Starting key rotation for $service_account"
+                        
+                            if ! check_service_account_exists "$service_account"; then
+                                return 0
+                            fi
+                        
+                            local new_key_file="/tmp/${service_name}_key.json"
+                            gcloud iam service-accounts keys create "$new_key_file" \
+                                --iam-account="$service_account" \
+                                --project="$PROJECT_ID" -q
+                        
+                            local gcs_key_path="gs://${BUCKET_NAME}/${service_name}/${service_name}_$(date +%Y%m%d%H%M%S).json"
+                            gsutil cp "$new_key_file" "$gcs_key_path"
+                            log_message "Uploaded new key to $gcs_key_path"
+                        
+                            if [[ "$service_account" == "service-account-key-admin@${PROJECT_ID}.iam.gserviceaccount.com" ]]; then
+                                log_message "Validating new key for key-admin service account"
+                                gcloud auth activate-service-account "$service_account" --key-file="$new_key_file" --project="$PROJECT_ID"
+                                
+                                if gcloud iam service-accounts keys list --iam-account="$service_account" --project="$PROJECT_ID" > /dev/null 2>&1; then
+                                    log_message "New key validated for key-admin service account"
+                                else
+                                    log_message "Failed to validate new key for key-admin; aborting rotation for this account."
+                                    rm "$new_key_file"
+                                    return 1
+                                fi
+                            fi
+                        
+                            local key_ids=($(gcloud iam service-accounts keys list \
+                                --iam-account="$service_account" \
+                                --project="$PROJECT_ID" \
+                                --managed-by="user" \
+                                --format="value(name)"))
+                        
+                            if [ "${#key_ids[@]}" -gt "$KEY_RETENTION_LIMIT" ]; then
+                                log_message "More than $KEY_RETENTION_LIMIT keys found. Backing up and deleting oldest keys..."
+                        
+                                for ((i=0; i<$((${#key_ids[@]} - $KEY_RETENTION_LIMIT)); i++)); do
+                                    oldest_key_id="${key_ids[$i]}"
+                        
+                                    local backup_key_file="/tmp/${service_name}_backup_${oldest_key_id##*/}.json"
+                                    gcloud iam service-accounts keys get-iam-policy "$oldest_key_id" \
+                                        --iam-account="$service_account" \
+                                        --project="$PROJECT_ID" --format="json" > "$backup_key_file"
+                        
+                                    local gcs_backup_path="gs://${BUCKET_NAME}/${service_name}/backup/${service_name}_backup_$(date +%Y%m%d%H%M%S)_${oldest_key_id##*/}.json"
+                                    gsutil cp "$backup_key_file" "$gcs_backup_path"
+                                    log_message "Backed up old key to $gcs_backup_path"
+                        
+                                    gcloud iam service-accounts keys delete "$oldest_key_id" \
+                                        --iam-account="$service_account" \
+                                        --project="$PROJECT_ID" -q
+                                    log_message "Deleted oldest key for $service_account: $oldest_key_id"
+                        
+                                    rm "$backup_key_file"
+                                done
+                            else
+                                log_message "Number of keys within limit; no deletion necessary."
+                            fi
+                        
+                            rm "$new_key_file"
+                        }
+                        
+                        log_message "Starting key rotation for all service accounts"
+                        for service_account in "${SERVICE_ACCOUNTS[@]}"; do
+                            rotate_key "$service_account" || log_message "Key rotation failed for $service_account"
+                        done
+                        log_message "Key rotation completed for all service accounts."
+                    '''
+                    
+                    // Write the script to a temporary file and execute it
+                    writeFile file: 'rotate_keys.sh', text: rotateKeysScript
+                    sh 'chmod +x rotate_keys.sh'
+                    sh './rotate_keys.sh'
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,39 @@
+pipeline {
+    agent any
+
+    environment {
+        PROJECT_ID = 'your-project-id'  // Replace with your actual Google Cloud Project ID
+    }
+
+    stages {
+        stage('Authenticate with Google Cloud') {
+            steps {
+                // Use the Google Service Account credential for authentication
+                withCredentials([googleServiceAccount(credentialsId: 'gcp-service-account-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
+                    // Run GCP authentication and configuration commands
+                    sh '''
+                        # Authenticate with Google Cloud using the service account key
+                        gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
+                        
+                        # Set the active project
+                        gcloud config set project $PROJECT_ID
+                        
+                        # Optional: Verify authentication and configuration
+                        gcloud auth list
+                        gcloud config list
+                    '''
+                }
+            }
+        }
+
+        // Additional stages can use gcloud commands now that authentication is set up
+        stage('Run GCP Commands') {
+            steps {
+                sh '''
+                    # Example: List available compute instances
+                    gcloud compute instances list --project=$PROJECT_ID
+                '''
+            }
+        }
+    }
+}

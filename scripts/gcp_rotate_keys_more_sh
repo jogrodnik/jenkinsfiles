@@ -5,34 +5,63 @@ set -o pipefail  # Catch errors in pipelines
 
 # Configuration
 PROJECT_ID="your-project-id"
-BUCKET_NAME="your-gcs-bucket"
-KEY_RETENTION_LIMIT=2  # The maximum number of keys to retain per service account
+KEY_RETENTION_LIMIT=2  # Maximum number of active keys to retain per service account
 SERVICE_ACCOUNTS=("service-account-1@your-project-id.iam.gserviceaccount.com" \
                   "service-account-2@your-project-id.iam.gserviceaccount.com" \
                   "service-account-key-admin@your-project-id.iam.gserviceaccount.com")
 
-# Log function with timestamps
+# Define the bucket name based on PROJECT_ID
+BUCKET_NAME="${PROJECT_ID}-key-management"
+
+# Check if the bucket exists; create it if it doesn't
+if ! gsutil ls -b "gs://${BUCKET_NAME}" > /dev/null 2>&1; then
+    echo "Bucket gs://${BUCKET_NAME} does not exist. Creating it now..."
+    gsutil mb -p "$PROJECT_ID" "gs://${BUCKET_NAME}"
+    echo "Bucket gs://${BUCKET_NAME} created."
+else
+    echo "Bucket gs://${BUCKET_NAME} already exists."
+fi
+
+# Function to log messages with timestamps
 log_message() {
     echo "$(date +'%Y-%m-%d %H:%M:%S') - $1"
 }
 
-# Rotate key for a specific service account
+# Function to check if a service account exists
+check_service_account_exists() {
+    local service_account=$1
+    if gcloud iam service-accounts describe "$service_account" --project "$PROJECT_ID" > /dev/null 2>&1; then
+        return 0  # Service account exists
+    else
+        log_message "Service account $service_account does not exist. Skipping rotation."
+        return 1  # Service account does not exist
+    fi
+}
+
+# Function to rotate keys for a specific service account
 rotate_key() {
     local service_account=$1
+    local service_name=${service_account%@*}  # Strip domain part of the email
+
     log_message "Starting key rotation for $service_account"
 
+    # Check if the service account exists before proceeding
+    if ! check_service_account_exists "$service_account"; then
+        return 0  # Skip rotation if service account doesn't exist
+    fi
+
     # Step 1: Generate a new key
-    local new_key_file="/tmp/${service_account//[@.]/_}_key.json"
+    local new_key_file="/tmp/${service_name}_key.json"
     gcloud iam service-accounts keys create "$new_key_file" \
         --iam-account="$service_account" \
         --project="$PROJECT_ID" -q
 
-    # Step 2: Upload the new key to the GCS bucket
-    local gcs_key_path="gs://${BUCKET_NAME}/${service_account}_$(date +%Y%m%d%H%M%S).json"
+    # Step 2: Define the GCS path for the new key and upload it
+    local gcs_key_path="gs://${BUCKET_NAME}/${service_name}/${service_name}_$(date +%Y%m%d%H%M%S).json"
     gsutil cp "$new_key_file" "$gcs_key_path"
     log_message "Uploaded new key to $gcs_key_path"
 
-    # Step 3: Verify and activate the new key (for key-admin accounts)
+    # Step 3: Validate the new key for the key-admin service account if necessary
     if [[ "$service_account" == "service-account-key-admin@your-project-id.iam.gserviceaccount.com" ]]; then
         log_message "Validating new key for key-admin service account"
 
@@ -49,30 +78,45 @@ rotate_key() {
         fi
     fi
 
-    # Step 4: Clean up old keys if exceeding the retention limit
+    # Step 4: Backup and clean up old keys if exceeding the retention limit
     local key_ids=($(gcloud iam service-accounts keys list \
         --iam-account="$service_account" \
         --project="$PROJECT_ID" \
         --managed-by="user" \
         --format="value(name)"))
 
-    # Check if keys exceed the retention limit and delete the oldest if so
     if [ "${#key_ids[@]}" -gt "$KEY_RETENTION_LIMIT" ]; then
-        log_message "More than $KEY_RETENTION_LIMIT keys found. Deleting oldest keys..."
+        log_message "More than $KEY_RETENTION_LIMIT keys found. Backing up and deleting oldest keys..."
 
-        # Sort keys by creation time and delete the oldest until we reach the retention limit
+        # Sort keys by creation time and delete the oldest after backing up
         for ((i=0; i<$((${#key_ids[@]} - $KEY_RETENTION_LIMIT)); i++)); do
             oldest_key_id="${key_ids[$i]}"
+
+            # Backup the key before deletion
+            local backup_key_file="/tmp/${service_name}_backup_${oldest_key_id##*/}.json"
+            gcloud iam service-accounts keys get-iam-policy "$oldest_key_id" \
+                --iam-account="$service_account" \
+                --project="$PROJECT_ID" --format="json" > "$backup_key_file"
+
+            # Define GCS path for the backup
+            local gcs_backup_path="gs://${BUCKET_NAME}/${service_name}/backup/${service_name}_backup_$(date +%Y%m%d%H%M%S)_${oldest_key_id##*/}.json"
+            gsutil cp "$backup_key_file" "$gcs_backup_path"
+            log_message "Backed up old key to $gcs_backup_path"
+
+            # Delete the oldest key
             gcloud iam service-accounts keys delete "$oldest_key_id" \
                 --iam-account="$service_account" \
                 --project="$PROJECT_ID" -q
             log_message "Deleted oldest key for $service_account: $oldest_key_id"
+
+            # Clean up local backup file
+            rm "$backup_key_file"
         done
     else
         log_message "Number of keys within limit; no deletion necessary."
     fi
 
-    # Step 5: Clean up the local key file
+    # Step 5: Clean up the local new key file
     rm "$new_key_file"
 }
 

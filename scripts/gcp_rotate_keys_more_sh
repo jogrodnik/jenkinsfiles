@@ -1,26 +1,25 @@
 #!/bin/bash
 
-set -e  # Exit on any error
-set -o pipefail  # Catch errors in pipelines
+# Exit script on any error
+set -e
+set -o pipefail
 
-# Configuration
-PROJECT_ID="your-project-id"
-KEY_RETENTION_LIMIT=2  # Maximum number of active keys to retain per service account
-SERVICE_ACCOUNTS=("service-account-1@your-project-id.iam.gserviceaccount.com" \
-                  "service-account-2@your-project-id.iam.gserviceaccount.com" \
-                  "service-account-key-admin@your-project-id.iam.gserviceaccount.com")
-
-# Define the bucket name based on PROJECT_ID
-BUCKET_NAME="${PROJECT_ID}-key-management"
-
-# Check if the bucket exists; create it if it doesn't
-if ! gsutil ls -b "gs://${BUCKET_NAME}" > /dev/null 2>&1; then
-    echo "Bucket gs://${BUCKET_NAME} does not exist. Creating it now..."
-    gsutil mb -p "$PROJECT_ID" "gs://${BUCKET_NAME}"
-    echo "Bucket gs://${BUCKET_NAME} created."
-else
-    echo "Bucket gs://${BUCKET_NAME} already exists."
+# Check for required arguments
+if [ "$#" -lt 4 ]; then
+    echo "Usage: $0 <PROJECT_ID> <BUCKET_NAME> <KMS_KEY> <SERVICE_ACCOUNTS>"
+    echo "Example: $0 my-project-id my-bucket-name projects/my-project/locations/us/keyRings/my-keyring/cryptoKeys/my-key service-account-1@my-project.iam.gserviceaccount.com,service-account-2@my-project.iam.gserviceaccount.com"
+    exit 1
 fi
+
+# Assign parameters to variables
+PROJECT_ID=$1
+BUCKET_NAME=$2
+KMS_KEY=$3
+IFS=',' read -r -a SERVICE_ACCOUNTS <<< "$4"  # Split comma-separated service accounts into an array
+
+# Define the bucket location
+LOCATION="US"
+KEY_RETENTION_LIMIT=2  # Maximum number of active keys to retain per service account
 
 # Function to log messages with timestamps
 log_message() {
@@ -62,7 +61,7 @@ rotate_key() {
     log_message "Uploaded new key to $gcs_key_path"
 
     # Step 3: Validate the new key for the key-admin service account if necessary
-    if [[ "$service_account" == "service-account-key-admin@your-project-id.iam.gserviceaccount.com" ]]; then
+    if [[ "$service_account" == "service-account-key-admin@${PROJECT_ID}.iam.gserviceaccount.com" ]]; then
         log_message "Validating new key for key-admin service account"
 
         # Temporarily authenticate with the new key
@@ -120,8 +119,17 @@ rotate_key() {
     rm "$new_key_file"
 }
 
-# Main loop to iterate over each service account
-log_message "Starting key rotation for all service accounts"
+# Check if the bucket already exists and create it with KMS encryption if it doesn’t
+if gsutil ls -p "$PROJECT_ID" "gs://$BUCKET_NAME" > /dev/null 2>&1; then
+    log_message "Bucket gs://$BUCKET_NAME already exists. No need to create."
+else
+    log_message "Creating bucket gs://$BUCKET_NAME with encryption key $KMS_KEY..."
+    gsutil mb -p "$PROJECT_ID" -l "$LOCATION" -b on -k "$KMS_KEY" "gs://$BUCKET_NAME"
+    log_message "Bucket gs://$BUCKET_NAME created with encryption key $KMS_KEY."
+fi
+
+# Main loop to iterate over each service account and rotate keys
+log_message "Starting key rotation for all specified service accounts"
 for service_account in "${SERVICE_ACCOUNTS[@]}"; do
     rotate_key "$service_account" || log_message "Key rotation failed for $service_account"
 done

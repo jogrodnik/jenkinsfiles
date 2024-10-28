@@ -2,6 +2,17 @@ pipeline {
     agent any
 
     stages {
+        stage('Check Credentials') {
+            steps {
+                script {
+                    def creds = com.cloudbees.plugins.credentials.CredentialsProvider.lookupCredentials(
+                        com.cloudbees.plugins.credentials.common.StandardCredentials.class,
+                        Jenkins.instance
+                    )
+                    creds.each { println "Credential ID: ${it.id}" }
+                }
+            }
+        }
         stage('Authenticate with GCP') {
             steps {
                 withCredentials([file(credentialsId: 'gcp-service-account-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
